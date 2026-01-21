@@ -2,148 +2,111 @@ import ccxt
 import time
 import requests
 import pandas as pd
+import os
 
 # ================== CONFIG ==================
-API_KEY = "YOUR_API_KEY"
-API_SECRET = "YOUR_API_SECRET"
+OKX_API_KEY = os.getenv("OKX_API_KEY")
+OKX_SECRET = os.getenv("OKX_SECRET")
+OKX_PASSWORD = os.getenv("OKX_PASSWORD")
 
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-TRADE_AMOUNT_USD = 20
-MAX_OPEN_TRADES = 5          # 3 – 7
-TIMEFRAME = '15m'
+TRADE_AMOUNT_USD = 3          # لكل صفقة
+MAX_OPEN_TRADES = 5           # 3 – 7
+TIMEFRAME = '5m'
+RSI_PERIOD = 14
+EMA_FAST = 9
+EMA_SLOW = 21
 CHECK_INTERVAL = 60
 
-# مؤشرات
-RSI_PERIOD = 14
-EMA_FAST = 50
-EMA_SLOW = 200
-
-# عملات حلال (قائمة أولية)
-HALAL_COINS = [
-    "BTC", "ETH", "BNB", "ADA", "SOL",
-    "MATIC", "AVAX", "DOT", "LINK", "XRP"
-]
-
-# كلمات محرّمة (استبعاد تلقائي)
-HARAM_KEYWORDS = [
-    "loan", "lend", "borrow",
-    "interest", "bank",
-    "leverage", "margin", "futures"
-]
-
-# ================== EXCHANGE ==================
-exchange = ccxt.binance({
-    "apiKey": API_KEY,
-    "secret": API_SECRET,
-    "enableRateLimit": True,
-    "options": {"defaultType": "spot"}
+# ================== OKX ==================
+exchange = ccxt.okx({
+    'apiKey': OKX_API_KEY,
+    'secret': OKX_SECRET,
+    'password': OKX_PASSWORD,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'}
 })
 
-open_trades = {}  # symbol: entry_price
-
-# ================== HELPERS ==================
-def send_telegram(msg):
+# ================== TELEGRAM ==================
+def notify(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
+# ================== BALANCE (FIXED) ==================
 def get_usdt_balance():
-    try:
-        balance = exchange.fetch_balance()
-        return float(balance.get("USDT", {}).get("free", 0))
-    except Exception:
-        return 0
+    balance = exchange.fetch_balance()
+    for asset in balance['info']['data'][0]['details']:
+        if asset['ccy'] == 'USDT':
+            return float(asset['availBal'])
+    return 0.0
 
-def is_halal_symbol(symbol):
-    base = symbol.split("/")[0]
-    if base not in HALAL_COINS:
-        return False
-    for word in HARAM_KEYWORDS:
-        if word.lower() in base.lower():
-            return False
-    return True
+# ================== HALAL FILTER ==================
+def halal_symbols():
+    markets = exchange.load_markets()
+    haram_keywords = ['BTC', 'ETH', 'BNB', 'XRP', 'DOGE']  # ربا/قروض/فوائد
+    halal = []
+    for s in markets:
+        if s.endswith('/USDT'):
+            base = s.split('/')[0]
+            if base not in haram_keywords:
+                halal.append(s)
+    return halal
 
-def fetch_indicators(symbol):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=EMA_SLOW + 5)
+# ================== INDICATORS ==================
+def indicators(symbol):
+    ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
     df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
-
     df['ema_fast'] = df['c'].ewm(span=EMA_FAST).mean()
     df['ema_slow'] = df['c'].ewm(span=EMA_SLOW).mean()
 
     delta = df['c'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(RSI_PERIOD).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(RSI_PERIOD).mean()
-    rs = gain / loss
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    rs = gain.rolling(RSI_PERIOD).mean() / loss.rolling(RSI_PERIOD).mean()
     df['rsi'] = 100 - (100 / (1 + rs))
-
     return df.iloc[-1]
 
-# ================== STRATEGY ==================
-def can_enter_trade(symbol):
+# ================== TRADE LOGIC ==================
+open_trades = {}
+
+def can_buy(symbol):
     if symbol in open_trades:
         return False
     if len(open_trades) >= MAX_OPEN_TRADES:
         return False
+    return True
 
-    ind = fetch_indicators(symbol)
+def try_buy(symbol):
+    ind = indicators(symbol)
 
-    trend_ok = ind['ema_fast'] > ind['ema_slow']
-    price_above = ind['c'] > ind['ema_slow']
-    rsi_ok = 30 < ind['rsi'] < 60
+    if ind['rsi'] < 30 and ind['ema_fast'] > ind['ema_slow']:
+        balance = get_usdt_balance()
+        if balance < TRADE_AMOUNT_USD:
+            return
 
-    return trend_ok and price_above and rsi_ok
-
-def open_trade(symbol):
-    price = exchange.fetch_ticker(symbol)['last']
-    amount = TRADE_AMOUNT_USD / price
-
-    exchange.create_market_buy_order(symbol, amount)
-    open_trades[symbol] = price
-
-    send_telegram(f"✅ BUY {symbol}\nEntry: {price}")
-
-def manage_trades():
-    for symbol in list(open_trades.keys()):
         price = exchange.fetch_ticker(symbol)['last']
-        entry = open_trades[symbol]
+        amount = TRADE_AMOUNT_USD / price
 
-        tp = entry * 1.02
-        sl = entry * 0.98
+        order = exchange.create_market_buy_order(symbol, amount)
+        open_trades[symbol] = order['price']
 
-        if price >= tp or price <= sl:
-            amount = exchange.fetch_balance()[symbol.split('/')[0]]['free']
-            exchange.create_market_sell_order(symbol, amount)
-            del open_trades[symbol]
-
-            send_telegram(f"❌ CLOSE {symbol}\nPrice: {price}")
+        notify(f"✅ شراء {symbol}\nRSI: {round(ind['rsi'],2)}")
 
 # ================== MAIN LOOP ==================
 def main():
-    send_telegram("🚀 Bot Started | Spot | Halal | RSI + EMA")
-
-    markets = exchange.load_markets()
-    symbols = [
-        s for s in markets
-        if s.endswith("/USDT") and is_halal_symbol(s)
-    ]
+    notify("🤖 البوت بدأ العمل (Spot + Halal + RSI/EMA)")
+    symbols = halal_symbols()
 
     while True:
-        usdt = get_usdt_balance()
-        if usdt < TRADE_AMOUNT_USD:
-            send_telegram("⚠️ رصيد USDT غير كافي")
-            time.sleep(300)
-            continue
-
-        for symbol in symbols:
-            try:
-                if can_enter_trade(symbol):
-                    open_trade(symbol)
-                    time.sleep(2)
-            except Exception as e:
-                print(symbol, e)
-
-        manage_trades()
+        try:
+            for symbol in symbols:
+                if can_buy(symbol):
+                    try_buy(symbol)
+                time.sleep(1)
+        except Exception as e:
+            notify(f"⚠️ خطأ: {str(e)}")
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
