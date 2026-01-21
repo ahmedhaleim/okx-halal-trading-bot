@@ -7,7 +7,10 @@ from halal_pairs import HALAL_PAIRS
 tg_bot = Bot(token=TELEGRAM_TOKEN)
 
 def notify(msg):
-    tg_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+    try:
+        tg_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+    except Exception as e:
+        print("Telegram error:", e)
 
 exchange = ccxt.okx({
     'apiKey': OKX_API_KEY,
