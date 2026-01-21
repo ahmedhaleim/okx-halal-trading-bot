@@ -4,7 +4,7 @@ import requests
 import pandas as pd
 import os
 
-# ================== CONFIG ==================
+# ================= CONFIG =================
 OKX_API_KEY = os.getenv("OKX_API_KEY")
 OKX_SECRET = os.getenv("OKX_SECRET")
 OKX_PASSWORD = os.getenv("OKX_PASSWORD")
@@ -12,102 +12,127 @@ OKX_PASSWORD = os.getenv("OKX_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-TRADE_AMOUNT_USD = 3          # لكل صفقة
-MAX_OPEN_TRADES = 5           # 3 – 7
-TIMEFRAME = '5m'
-RSI_PERIOD = 14
-EMA_FAST = 9
-EMA_SLOW = 21
-CHECK_INTERVAL = 60
+DASHBOARD_URL = os.getenv("DASHBOARD_URL")  # Vercel endpoint
 
-# ================== OKX ==================
+TIMEFRAME = "5m"
+TRADE_USD = 3
+MAX_TRADES = 5
+
+ATR_PERIOD = 14
+ATR_MULTIPLIER = 1.5  # قوة التتبع
+
+# ================= EXCHANGE =================
 exchange = ccxt.okx({
-    'apiKey': OKX_API_KEY,
-    'secret': OKX_SECRET,
-    'password': OKX_PASSWORD,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
+    "apiKey": OKX_API_KEY,
+    "secret": OKX_SECRET,
+    "password": OKX_PASSWORD,
+    "options": {"defaultType": "spot"}
 })
 
-# ================== TELEGRAM ==================
+# ================= STATE =================
+open_trades = {}
+total_profit = 0.0
+
+# ================= UTIL =================
 def notify(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg},
+            timeout=5
+        )
+    except:
+        pass
 
-# ================== BALANCE (FIXED) ==================
-def get_usdt_balance():
-    balance = exchange.fetch_balance()
-    for asset in balance['info']['data'][0]['details']:
-        if asset['ccy'] == 'USDT':
-            return float(asset['availBal'])
-    return 0.0
+def push_dashboard():
+    try:
+        requests.post(DASHBOARD_URL, json={
+            "open_trades": open_trades,
+            "profit": round(total_profit, 2)
+        }, timeout=5)
+    except:
+        pass
 
-# ================== HALAL FILTER ==================
+# ================= HALAL FILTER =================
 def halal_symbols():
+    haram = ["BTC", "ETH", "BNB", "XRP", "DOGE"]
     markets = exchange.load_markets()
-    haram_keywords = ['BTC', 'ETH', 'BNB', 'XRP', 'DOGE']  # ربا/قروض/فوائد
-    halal = []
-    for s in markets:
-        if s.endswith('/USDT'):
-            base = s.split('/')[0]
-            if base not in haram_keywords:
-                halal.append(s)
-    return halal
+    return [
+        s for s in markets
+        if s.endswith("/USDT") and s.split("/")[0] not in haram
+    ]
 
-# ================== INDICATORS ==================
+# ================= INDICATORS =================
 def indicators(symbol):
     ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
-    df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
-    df['ema_fast'] = df['c'].ewm(span=EMA_FAST).mean()
-    df['ema_slow'] = df['c'].ewm(span=EMA_SLOW).mean()
+    df = pd.DataFrame(ohlcv, columns=["t","o","h","l","c","v"])
 
-    delta = df['c'].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    rs = gain.rolling(RSI_PERIOD).mean() / loss.rolling(RSI_PERIOD).mean()
-    df['rsi'] = 100 - (100 / (1 + rs))
+    # EMA
+    df["ema9"] = df["c"].ewm(span=9).mean()
+    df["ema21"] = df["c"].ewm(span=21).mean()
+
+    # RSI
+    delta = df["c"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    df["rsi"] = 100 - (100 / (1 + gain / loss))
+
+    # ATR
+    df["tr"] = df[["h","l","c"]].max(axis=1) - df[["h","l","c"]].min(axis=1)
+    df["atr"] = df["tr"].rolling(ATR_PERIOD).mean()
+
     return df.iloc[-1]
 
-# ================== TRADE LOGIC ==================
-open_trades = {}
+# ================= MAIN =================
+notify("🤖 Bot Started with ATR Trailing Stop")
+symbols = halal_symbols()
 
-def can_buy(symbol):
-    if symbol in open_trades:
-        return False
-    if len(open_trades) >= MAX_OPEN_TRADES:
-        return False
-    return True
+while True:
+    try:
+        # ===== ENTRY =====
+        for s in symbols:
+            if s in open_trades or len(open_trades) >= MAX_TRADES:
+                continue
 
-def try_buy(symbol):
-    ind = indicators(symbol)
+            ind = indicators(s)
+            if ind["rsi"] < 30 and ind["ema9"] > ind["ema21"]:
+                price = exchange.fetch_ticker(s)["last"]
+                amount = TRADE_USD / price
 
-    if ind['rsi'] < 30 and ind['ema_fast'] > ind['ema_slow']:
-        balance = get_usdt_balance()
-        if balance < TRADE_AMOUNT_USD:
-            return
+                exchange.create_market_buy_order(s, amount)
 
-        price = exchange.fetch_ticker(symbol)['last']
-        amount = TRADE_AMOUNT_USD / price
+                open_trades[s] = {
+                    "entry": price,
+                    "amount": amount,
+                    "highest": price,
+                    "atr": ind["atr"],
+                    "sl": price - (ind["atr"] * ATR_MULTIPLIER)
+                }
 
-        order = exchange.create_market_buy_order(symbol, amount)
-        open_trades[symbol] = order['price']
+                notify(f"✅ BUY {s}")
 
-        notify(f"✅ شراء {symbol}\nRSI: {round(ind['rsi'],2)}")
+        # ===== TRAILING STOP =====
+        for s in list(open_trades):
+            trade = open_trades[s]
+            price = exchange.fetch_ticker(s)["last"]
 
-# ================== MAIN LOOP ==================
-def main():
-    notify("🤖 البوت بدأ العمل (Spot + Halal + RSI/EMA)")
-    symbols = halal_symbols()
+            # تحديث أعلى سعر
+            if price > trade["highest"]:
+                trade["highest"] = price
+                trade["sl"] = price - (trade["atr"] * ATR_MULTIPLIER)
 
-    while True:
-        try:
-            for symbol in symbols:
-                if can_buy(symbol):
-                    try_buy(symbol)
-                time.sleep(1)
-        except Exception as e:
-            notify(f"⚠️ خطأ: {str(e)}")
-        time.sleep(CHECK_INTERVAL)
+            # ضرب وقف الخسارة
+            if price <= trade["sl"]:
+                exchange.create_market_sell_order(s, trade["amount"])
+                profit = (price - trade["entry"]) * trade["amount"]
+                total_profit += profit
 
-if __name__ == "__main__":
-    main()
+                notify(f"📉 SELL {s} | Profit: {round(profit,2)}$")
+                del open_trades[s]
+
+        push_dashboard()
+
+    except Exception as e:
+        notify(f"⚠️ {str(e)}")
+
+    time.sleep(60)
