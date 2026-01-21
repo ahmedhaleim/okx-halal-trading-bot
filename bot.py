@@ -12,14 +12,14 @@ OKX_PASSWORD = os.getenv("OKX_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-DASHBOARD_URL = os.getenv("DASHBOARD_URL")  # Vercel endpoint
+DASHBOARD_URL = os.getenv("DASHBOARD_URL")
 
 TIMEFRAME = "5m"
 TRADE_USD = 3
 MAX_TRADES = 5
 
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 1.5  # قوة التتبع
+ATR_MULTIPLIER = 1.5
 
 # ================= EXCHANGE =================
 exchange = ccxt.okx({
@@ -67,24 +67,34 @@ def indicators(symbol):
     ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
     df = pd.DataFrame(ohlcv, columns=["t","o","h","l","c","v"])
 
-    # EMA
     df["ema9"] = df["c"].ewm(span=9).mean()
     df["ema21"] = df["c"].ewm(span=21).mean()
 
-    # RSI
     delta = df["c"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = -delta.clip(upper=0).rolling(14).mean()
     df["rsi"] = 100 - (100 / (1 + gain / loss))
 
-    # ATR
     df["tr"] = df[["h","l","c"]].max(axis=1) - df[["h","l","c"]].min(axis=1)
     df["atr"] = df["tr"].rolling(ATR_PERIOD).mean()
 
     return df.iloc[-1]
 
+# ================= SAFE MARKET SELL =================
+def safe_market_sell(symbol, amount):
+    for attempt in range(3):
+        try:
+            exchange.cancel_all_orders(symbol)
+            exchange.create_market_sell_order(symbol, amount)
+            return True
+        except Exception as e:
+            time.sleep(1)
+            last_error = str(e)
+    notify(f"🚨 SELL FAILED {symbol}: {last_error}")
+    return False
+
 # ================= MAIN =================
-notify("🤖 Bot Started with ATR Trailing Stop")
+notify("🤖 Bot Started (Fixed Stop Loss Logic)")
 symbols = halal_symbols()
 
 while True:
@@ -96,7 +106,8 @@ while True:
 
             ind = indicators(s)
             if ind["rsi"] < 30 and ind["ema9"] > ind["ema21"]:
-                price = exchange.fetch_ticker(s)["last"]
+                ticker = exchange.fetch_ticker(s)
+                price = ticker["ask"]  # BUY at ASK
                 amount = TRADE_USD / price
 
                 exchange.create_market_buy_order(s, amount)
@@ -106,29 +117,34 @@ while True:
                     "amount": amount,
                     "highest": price,
                     "atr": ind["atr"],
-                    "sl": price - (ind["atr"] * ATR_MULTIPLIER)
+                    "sl": price - (ind["atr"] * ATR_MULTIPLIER),
+                    "stopped": False
                 }
 
                 notify(f"✅ BUY {s}")
 
-        # ===== TRAILING STOP =====
+        # ===== TRAILING STOP (FIXED) =====
         for s in list(open_trades):
             trade = open_trades[s]
-            price = exchange.fetch_ticker(s)["last"]
+            ticker = exchange.fetch_ticker(s)
+            price = ticker["bid"]  # 🔥 BEST BID فقط
 
             # تحديث أعلى سعر
             if price > trade["highest"]:
                 trade["highest"] = price
                 trade["sl"] = price - (trade["atr"] * ATR_MULTIPLIER)
 
-            # ضرب وقف الخسارة
-            if price <= trade["sl"]:
-                exchange.create_market_sell_order(s, trade["amount"])
-                profit = (price - trade["entry"]) * trade["amount"]
-                total_profit += profit
+            # STOP LOSS HIT
+            if price <= trade["sl"] and not trade["stopped"]:
+                trade["stopped"] = True
 
-                notify(f"📉 SELL {s} | Profit: {round(profit,2)}$")
-                del open_trades[s]
+                success = safe_market_sell(s, trade["amount"])
+                if success:
+                    profit = (price - trade["entry"]) * trade["amount"]
+                    total_profit += profit
+
+                    notify(f"🛑 STOP LOSS SELL {s} | P/L: {round(profit,2)}$")
+                    del open_trades[s]
 
         push_dashboard()
 
