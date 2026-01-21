@@ -21,8 +21,13 @@ exchange = ccxt.okx({
 })
 
 def get_balance():
-    balance = exchange.fetch_balance()
-    return balance['USDT']['free']
+    try:
+        balance = exchange.fetch_balance()
+        usdt_free = balance.get('free', {}).get('USDT', 0)
+        return float(usdt_free)
+    except Exception as e:
+        print("Balance error:", e)
+        return 0
 
 def simple_signal():
     return True  # نطوره لاحقًا
@@ -49,11 +54,12 @@ def trade(pair):
 def main():
     notify("🤖 البوت يعمل الآن (Spot + Halal)")
     while True:
-        if get_balance() >= TRADE_AMOUNT_USD:
-            for pair in HALAL_PAIRS:
-                if simple_signal():
-                    trade(pair)
-                    time.sleep(30)
-        time.sleep(60)
+       balance = get_balance()
+
+if balance < TRADE_AMOUNT_USD:
+    notify(f"⚠️ رصيد USDT غير كافٍ: {balance}")
+    time.sleep(60)
+    continue
+
 
 main()
